@@ -40,6 +40,20 @@ class AccountMove(models.Model):
             return move.quantity * sign
         return 0
 
+    def _get_refund_quantity_by_picking(self, invoice_line, qty_by_picking):
+        """A credit note line can be linked to more stock quantity than the
+        refunded one: e.g. a partial or price refund made with the reversal
+        wizard keeps the moves of the original invoice line. Print in each
+        picking only the refunded quantity, never the delivered one."""
+        to_assign = invoice_line.quantity
+        res = {}
+        for picking, qty in qty_by_picking.items():
+            qty = min(abs(qty), to_assign)
+            if qty or not res:
+                res[picking] = qty
+            to_assign -= qty
+        return res
+
     def _process_section_note_lines_grouped(
         self, previous_section, previous_note, lines_dic, pick_order=None
     ):
@@ -108,19 +122,25 @@ class AccountMove(models.Model):
                 continue
             # Reset sections and notes when encountering a regular line
             last_section_notes = []
-            has_returned_qty = False
             remaining_qty = line.quantity
             # Process moves related to the line
+            qty_by_picking = {}
             for move in line.move_line_ids:
-                key = (move.picking_id, line)
-                self._process_section_note_lines_grouped(
-                    previous_section, previous_note, picking_dict, move.picking_id
-                )
                 qty = self._get_signed_quantity_done(line, move, sign)
+                qty_by_picking[move.picking_id] = (
+                    qty_by_picking.get(move.picking_id, 0.0) + qty
+                )
+            if self.move_type == "out_refund" and qty_by_picking:
+                qty_by_picking = self._get_refund_quantity_by_picking(
+                    line, qty_by_picking
+                )
+            for picking, qty in qty_by_picking.items():
+                key = (picking, line)
+                self._process_section_note_lines_grouped(
+                    previous_section, previous_note, picking_dict, picking
+                )
                 picking_dict[key] = picking_dict.get(key, 0.0) + qty
                 remaining_qty -= qty
-                if move.location_id.usage == "customer":
-                    has_returned_qty = True
             # Process sale order lines without moves
             if not line.move_line_ids and line.sale_line_ids:
                 for so_line in line.sale_line_ids:
@@ -142,22 +162,10 @@ class AccountMove(models.Model):
                 qty = line.quantity
                 picking_dict[key] = picking_dict.get(key, 0.0) + qty
                 remaining_qty -= qty
-            # To avoid to print duplicate lines because the invoice is a refund
-            # without returned goods to refund.
             remaining_qty = float_round(
                 remaining_qty,
                 precision_rounding=line.product_id.uom_id.rounding or 0.01,
             )
-            if (
-                self.move_type == "out_refund"
-                and not has_returned_qty
-                and remaining_qty
-                and line.product_id.type != "service"
-                and picking_dict
-            ):
-                remaining_qty = 0.0
-                for key in picking_dict:
-                    picking_dict[key] = abs(picking_dict[key])
             if remaining_qty:
                 self._process_section_note_lines_grouped(
                     previous_section, previous_note, lines_dict

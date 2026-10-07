@@ -347,3 +347,48 @@ class TestAccountInvoiceGroupPicking(AccountTestInvoicingCommon):
         ].decode()
         self.assertEqual(self._count_sale_in_picking_header(content, self.sale.name), 0)
         self.assertFalse(self.sale.invoice_ids.picking_ids[:1].name in tbody)
+
+    def _deliver_and_invoice(self):
+        self.sale.action_confirm()
+        picking = self.sale.picking_ids
+        picking.move_ids.quantity = 2
+        picking.move_ids.picked = True
+        picking.button_validate()
+        invoice = self.sale._create_invoices()
+        invoice.action_post()
+        return picking, invoice
+
+    def _refund(self, invoice):
+        reversal = (
+            self.env["account.move.reversal"]
+            .with_context(active_model="account.move", active_ids=invoice.ids)
+            .create({"reason": "test", "journal_id": invoice.journal_id.id})
+            .refund_moves()
+        )
+        return self.env["account.move"].browse(reversal["res_id"])
+
+    def test_account_invoice_group_picking_partial_refund_without_return(self):
+        picking, invoice = self._deliver_and_invoice()
+        refund = self._refund(invoice)
+        refund_line = refund.invoice_line_ids.filtered(
+            lambda ln: ln.product_id == self.product
+        )
+        refund_line.quantity = 1
+        groups = [
+            g for g in refund.lines_grouped_by_picking() if g["line"] == refund_line
+        ]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["picking"], picking)
+        self.assertEqual(groups[0]["quantity"], 1)
+        # Price refund of the whole delivery expressed as a single unit
+        refund_line.write({"quantity": 1, "price_unit": 10})
+        content = html.document_fromstring(
+            self.env["ir.actions.report"]._render_qweb_html(
+                "account.account_invoices", refund.id
+            )[0]
+        )
+        tbody = html.tostring(
+            content.xpath("//tbody[@class='invoice_tbody']")[0], encoding="unicode"
+        )
+        self.assertIn(picking.name, tbody)
+        self.assertNotIn("2.00", tbody)
